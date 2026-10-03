@@ -1,0 +1,48 @@
+name: Dashboard image (fork)
+on:
+  push:
+    branches: [ci/image-build]
+    tags: ["dashboard-v*"]
+permissions:
+  contents: read
+  packages: write
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/dashboard
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve version from tag
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^dashboard-v' | head -1 || true)
+          if [ -z "$TAG" ]; then
+            for ref in "$GITHUB_REF" "${{ github.ref_name }}"; do
+              case "$ref" in dashboard-v*) TAG="$ref"; break;; esac
+            done
+          fi
+          VERSION=$(echo "$TAG" | sed 's/^dashboard-v//')
+          if [ -z "$VERSION" ]; then VERSION="sha-${GITHUB_SHA::7}"; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building ghcr.io/vectorwren/cliproxyapi-dashboard/dashboard:$VERSION"
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: ./dashboard
+          file: ./dashboard/Dockerfile
+          platforms: linux/amd64
+          no-cache: true
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            DASHBOARD_VERSION=dashboard-v${{ env.VERSION }}
