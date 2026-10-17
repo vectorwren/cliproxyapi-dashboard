@@ -95,8 +95,18 @@ describe("isShortTermQuotaWindow", () => {
 
 describe("capacityQuotaGroups", () => {
   const groups = ["gemini-weekly", "gemini-5h", "claude-gpt-weekly", "claude-gpt-5h"].map((id) => ({ id, label: id, resetTime: null }));
-  it("keeps only Gemini windows for Antigravity", () => {
-    expect(capacityQuotaGroups("antigravity", groups).map(({ id }) => id)).toEqual(["gemini-weekly", "gemini-5h"]);
+  it("keeps Gemini AND Claude/GPT windows for Antigravity (both families count since the 2026-10-18 bar-rule change)", () => {
+    expect(capacityQuotaGroups("antigravity", groups).map(({ id }) => id)).toEqual(
+      ["gemini-weekly", "gemini-5h", "claude-gpt-weekly", "claude-gpt-5h"],
+    );
+  });
+  it("keeps Gemini-only windows when that is all Antigravity supplies (legacy shape)", () => {
+    const geminiOnly = groups.slice(0, 2);
+    expect(capacityQuotaGroups("antigravity", geminiOnly).map(({ id }) => id)).toEqual(["gemini-weekly", "gemini-5h"]);
+  });
+  it("keeps Claude/GPT-only windows when that is all Antigravity supplies (shape since upstream dropped the Gemini family)", () => {
+    const claudeOnly = groups.slice(2);
+    expect(capacityQuotaGroups("antigravity", claudeOnly).map(({ id }) => id)).toEqual(["claude-gpt-weekly", "claude-gpt-5h"]);
   });
   it("keeps every window for other providers", () => {
     expect(capacityQuotaGroups("claude", groups)).toHaveLength(4);
