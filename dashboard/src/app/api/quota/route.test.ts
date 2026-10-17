@@ -280,7 +280,10 @@ describe("GET /api/quota - Gemini CLI support (issue #125)", () => {
     expect(body.accounts[0].snapshotSource).toContain("daily-cloudcode-pa.googleapis.com");
   });
 
-  it("collects a SECOND successful summary and still routes to the FIRST candidate when a late endpoint fails", async () => {
+  it.each([
+    [403, "Access denied"],
+    [422, "Unprocessable"],
+  ])("collects a SECOND successful summary and still routes to the FIRST candidate when a late endpoint returns %i", async (statusCode, errorMessage) => {
     const authFilesResponse = {
       files: [{ auth_index: 0, provider: "antigravity", email: "test@gmail.com", disabled: false, status: "active" }],
     };
@@ -303,14 +306,14 @@ describe("GET /api/quota - Gemini CLI support (issue #125)", () => {
       if (body.includes("daily-cloudcode-pa.googleapis.com")) return { ok: true, json: async () => ({ status_code: 200, body: JSON.stringify(claudeOnlySummary) }) };
       // Success #2 (still non-preferred): both candidates now collected.
       if (body.includes("daily-cloudcode-pa.sandbox.googleapis.com")) return { ok: true, json: async () => ({ status_code: 200, body: JSON.stringify(distinctClaudeOnlySummary) }) };
-      // Late fatal 403 with TWO candidates in hand — retention break must fire.
+      // Late fatal failure with TWO candidates in hand — retention break must fire.
       sawLateFailure = true;
-      return { ok: true, json: async () => ({ status_code: 403, body: JSON.stringify({ error: { message: "Access denied" } }) }) };
+      return { ok: true, json: async () => ({ status_code: statusCode, body: JSON.stringify({ error: { message: errorMessage } }) }) };
     });
     const { GET } = await import("./route");
     const response = await GET(new Request("http://localhost/api/quota") as NextRequest);
     const body = await response.json();
-    // Both successes landed and the late 403 branch actually executed.
+    // Both successes landed and the late-failure branch actually executed.
     const summaryCalls = fetchMock.mock.calls.filter((c) => String(c[1]?.body).includes("retrieveUserQuotaSummary"));
     expect(summaryCalls.length).toBe(3);
     expect(sawLateFailure).toBe(true);
@@ -318,6 +321,48 @@ describe("GET /api/quota - Gemini CLI support (issue #125)", () => {
     expect(body.accounts[0].groups.map((group: QuotaGroup) => group.id)).toEqual(["claude-gpt-weekly"]);
     expect(body.accounts[0].groups[0].remainingFraction).toBe(0.48);
     expect(body.accounts[0].snapshotSource).toContain("https://daily-cloudcode-pa.googleapis.com");
+  });
+
+  it("preferred break fires AFTER a non-preferred success: two successes route to the SECOND, trailing endpoint never probed", async () => {
+    const authFilesResponse = {
+      files: [{ auth_index: 0, provider: "antigravity", email: "test@gmail.com", disabled: false, status: "active" }],
+    };
+    const claudeOnlySummary = {
+      groups: [{ displayName: "Claude and GPT models", buckets: [
+        { bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.48, resetTime: "2026-04-14T18:00:00Z" },
+      ] }],
+    };
+    const geminiBearingSummary = {
+      groups: [
+        { displayName: "Gemini Models", buckets: [
+          { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.31, resetTime: "2026-04-14T12:00:00Z" },
+        ] },
+        { displayName: "Claude and GPT models", buckets: [
+          { bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.55, resetTime: "2026-04-14T21:00:00Z" },
+        ] },
+      ],
+    };
+    fetchMock.mockImplementation(async (_url: string, options?: { body?: string }) => {
+      const body = String(options?.body ?? "");
+      if (String(_url).endsWith("/auth-files")) return { ok: true, json: async () => authFilesResponse };
+      if (body.includes("loadCodeAssist")) return { ok: true, json: async () => ({ status_code: 200, body: { cloudaicompanionProject: "p" } }) };
+      // Success #1 (non-preferred): the loop must keep probing.
+      if (body.includes("daily-cloudcode-pa.googleapis.com")) return { ok: true, json: async () => ({ status_code: 200, body: JSON.stringify(claudeOnlySummary) }) };
+      // Success #2 (Gemini-bearing): the preferred break must fire here.
+      if (body.includes("daily-cloudcode-pa.sandbox.googleapis.com")) return { ok: true, json: async () => ({ status_code: 200, body: JSON.stringify(geminiBearingSummary) }) };
+      return { ok: true, json: async () => ({ status_code: 200, body: JSON.stringify(geminiBearingSummary) }) };
+    });
+    const { GET } = await import("./route");
+    const response = await GET(new Request("http://localhost/api/quota") as NextRequest);
+    const body = await response.json();
+    // auth-files + loadCodeAssist + daily(200, keep probing) + sandbox(200, preferred break)
+    // — the trailing cloudcode-pa endpoint is never probed.
+    const summaryCalls = fetchMock.mock.calls.filter((c) => String(c[1]?.body).includes("retrieveUserQuotaSummary"));
+    expect(summaryCalls.length).toBe(2);
+    // Selection returns the SECOND candidate (the Gemini-bearing one), not candidates[0].
+    expect(body.accounts[0].groups.map((group: QuotaGroup) => group.id)).toEqual(["gemini-weekly", "claude-gpt-weekly"]);
+    expect(body.accounts[0].groups[0].remainingFraction).toBe(0.31);
+    expect(body.accounts[0].snapshotSource).toContain("https://daily-cloudcode-pa.sandbox.googleapis.com");
   });
 
   it("models fetcher keeps FIRST-SUCCESS (no Gemini preference) while summary prefers Gemini", async () => {
