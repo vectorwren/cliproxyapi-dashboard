@@ -72,12 +72,22 @@ describe("Antigravity quota details", () => {
     expect(html).toContain(`>${expected}<`);
   });
 
-  it("summarizes the account with Gemini windows only", () => {
+  it("summarizes the account across Gemini AND Claude/GPT windows (minimum per term)", () => {
     const html = renderAccounts([account]);
     const accountRow = html.match(/<button[^>]*>[\s\S]*?<\/button>/)?.[0];
     expect(accountRow).toContain(">31%<");
     expect(accountRow).toContain(">82%<");
-    expect(accountRow).not.toContain(">48%<");
+    expect(accountRow).not.toMatch(/>-<\/span>/);
+  });
+  it("summarizes the account from Claude/GPT windows alone when Gemini is absent upstream", () => {
+    const claudeOnly: QuotaAccount = {
+      ...account,
+      groups: account.groups!.slice(2),
+    };
+    const html = renderAccounts([claudeOnly]);
+    const accountRow = html.match(/<button[^>]*>[\s\S]*?<\/button>/)?.[0];
+    expect(accountRow).toContain(">48%<");
+    expect(accountRow).toContain(">90%<");
     expect(accountRow).not.toMatch(/>-<\/span>/);
   });
 

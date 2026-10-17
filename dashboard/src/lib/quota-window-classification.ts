@@ -9,11 +9,16 @@ export interface QuotaWindowLike {
   resetTime: string | null;
 }
 
-// Antigravity's Claude/GPT windows are shown for reference but excluded from
-// capacity bars and aggregates; only its Gemini windows count.
+// Antigravity capacity surfaces (bars, account Long/Short-Term cells, overall
+// aggregate) use its Gemini windows AND its Claude/GPT windows — the minimum
+// per term across both families. Since upstream dropped the Gemini family
+// (observed 2026-10-18, /tmp/gemini-bar-20261018/REPORT.md) this is the
+// Google Antigravity allowance (daily-cloudcode-pa), DISTINCT from the
+// separate Anthropic Claude subscription the `claude` provider row tracks.
+// No window is fabricated or relabeled: only what upstream reports is shown.
 export function capacityQuotaGroups<T extends QuotaWindowLike>(provider: string, groups: readonly T[]): T[] {
   if (provider.toLowerCase() !== "antigravity") return [...groups];
-  return groups.filter((group) => group.id.startsWith("gemini-"));
+  return groups.filter((group) => group.id.startsWith("gemini-") || group.id.startsWith("claude-gpt-"));
 }
 
 function hasExplicitShortTermMarker(group: QuotaWindowLike): boolean {
