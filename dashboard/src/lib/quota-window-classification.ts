@@ -2,10 +2,12 @@ const HOUR_MS = 60 * 60 * 1000;
 const SHORT_TERM_CLUSTER_WINDOW_MS = 6 * HOUR_MS;
 const SHORT_TERM_CLUSTER_MIN_SPREAD_MS = 12 * HOUR_MS;
 const SHORT_TERM_RESET_FALLBACK_MS = 24 * HOUR_MS;
+const SHORT_TERM_MAX_WINDOW_MS = 24 * HOUR_MS;
 
 export interface QuotaWindowLike {
   id: string;
   label: string;
+  windowSeconds?: number;
   resetTime: string | null;
 }
 
@@ -15,10 +17,15 @@ export interface QuotaWindowLike {
 // (observed 2026-10-18, /tmp/gemini-bar-20261018/REPORT.md) this is the
 // Google Antigravity allowance (daily-cloudcode-pa), DISTINCT from the
 // separate Anthropic Claude subscription the `claude` provider row tracks.
-// No window is fabricated or relabeled: only what upstream reports is shown.
+// The Pro-only Gemini 4 Argon windows (upstream #330) stay reference-only
+// and never feed capacity. No window is fabricated or relabeled: only what
+// upstream reports is shown.
 export function capacityQuotaGroups<T extends QuotaWindowLike>(provider: string, groups: readonly T[]): T[] {
   if (provider.toLowerCase() !== "antigravity") return [...groups];
-  return groups.filter((group) => group.id.startsWith("gemini-") || group.id.startsWith("claude-gpt-"));
+  return groups.filter((group) =>
+    (group.id.startsWith("gemini-") || group.id.startsWith("claude-gpt-")) &&
+    !group.id.startsWith("gemini-argon-")
+  );
 }
 
 function hasExplicitShortTermMarker(group: QuotaWindowLike): boolean {
@@ -50,6 +57,10 @@ export function isShortTermQuotaWindow(
   group: QuotaWindowLike,
   siblingGroups: readonly QuotaWindowLike[] = []
 ): boolean {
+  // Provider-reported duration takes precedence over display labels and ID heuristics.
+  if (typeof group.windowSeconds === "number" && Number.isFinite(group.windowSeconds) && group.windowSeconds > 0) {
+    return group.windowSeconds * 1000 <= SHORT_TERM_MAX_WINDOW_MS;
+  }
   const id = group.id.toLowerCase();
   if (id === "seven-day" || id.startsWith("seven-day-")) {
     return false;

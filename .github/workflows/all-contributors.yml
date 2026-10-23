@@ -9,18 +9,24 @@ on:
         description: 'PR number to add contributors for'
         required: false
 
+# pull_request_target is privileged; safe here only because it checks out main (never PR code)
+# and interpolates no PR-controlled data into a shell. Keep it that way.
+permissions: {}
+
 jobs:
   add-contributor:
     if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && github.event.pull_request.user.login != 'github-actions[bot]' && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-latest
+    # Per the action's README (v0.6.2): it only posts @all-contributors comments, no git push.
     permissions:
-      contents: write
+      contents: read
+      issues: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
 
-      - uses: JoshuaKGoldberg/all-contributors-auto-action@v0.6.0
+      - uses: JoshuaKGoldberg/all-contributors-auto-action@c578423db9b2c14d3cee9c72f6c2aed31c128030 # v0.7.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

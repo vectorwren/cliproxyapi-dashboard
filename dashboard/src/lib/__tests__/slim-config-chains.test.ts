@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { buildSlimConfig } from "../config-generators/oh-my-opencode-slim";
-import type { OhMyOpenCodeSlimFullConfig } from "../config-generators/oh-my-opencode-slim-types";
+import { buildSlimConfigChecked, type GeneratedSlimConfig } from "./helpers/slim-schema-guard";
+import { validateSlimConfig } from "../config-generators/oh-my-opencode-slim-types";
 
-function expectGeneratedConfig(config: ReturnType<typeof buildSlimConfig>): OhMyOpenCodeSlimFullConfig {
+function expectGeneratedConfig(config: ReturnType<typeof buildSlimConfigChecked>): GeneratedSlimConfig {
   expect(config).not.toBeNull();
-  return config as OhMyOpenCodeSlimFullConfig;
+  return config as GeneratedSlimConfig;
 }
 
 describe("buildSlimConfig – fallback chains behavior", () => {
   it("should passthrough external models and prefix available ones", () => {
     const available = ["model-a", "model-b"];
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       fallback: {
         enabled: true,
         chains: {
@@ -22,23 +22,20 @@ describe("buildSlimConfig – fallback chains behavior", () => {
       },
     });
 
-    expect(config).not.toBeNull();
-    const fallback = (config as Record<string, unknown>).fallback as Record<string, unknown>;
-    expect(fallback).toBeDefined();
+    const generated = expectGeneratedConfig(config);
+    expect(generated.fallback).not.toHaveProperty("chains");
 
-    const chains = fallback.chains as Record<string, string[]> | undefined;
-
-    // Both chains should be present
-    expect(chains).toBeDefined();
-    // Available models get prefixed
-    expect(chains!.oracle).toEqual(["cliproxyapi/model-a", "cliproxyapi/model-b"]);
+    // Chains land after the auto-picked primary; available models get prefixed
+    const oracle = generated.presets?.cliproxyapi?.oracle?.model as string[];
+    expect(oracle.slice(-2)).toEqual(["cliproxyapi/model-a", "cliproxyapi/model-b"]);
     // External models are passed through as-is (not prefixed)
-    expect(chains!.orchestrator).toEqual(["model-x", "model-y"]);
+    const orchestrator = generated.presets?.cliproxyapi?.orchestrator?.model as string[];
+    expect(orchestrator.slice(-2)).toEqual(["model-x", "model-y"]);
   });
 
   it("should preserve chains with all external models", () => {
     const available = ["model-a"];
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       fallback: {
         enabled: true,
         chains: {
@@ -49,15 +46,11 @@ describe("buildSlimConfig – fallback chains behavior", () => {
       },
     });
 
-    expect(config).not.toBeNull();
-    const fallback = (config as Record<string, unknown>).fallback as Record<string, unknown>;
-    expect(fallback).toBeDefined();
-    
-    const chains = fallback.chains as Record<string, string[]> | undefined;
-    // External models are passed through as-is
-    expect(chains).toBeDefined();
-    expect(chains!.orchestrator).toEqual(["model-x"]);
-    expect(chains!.oracle).toEqual(["model-y"]);
+    const generated = expectGeneratedConfig(config);
+    expect(generated.fallback).not.toHaveProperty("chains");
+    // External models are passed through as-is, after the primary
+    expect(generated.presets?.cliproxyapi?.orchestrator?.model).toEqual(["cliproxyapi/model-a", "model-x"]);
+    expect(generated.presets?.cliproxyapi?.oracle?.model).toEqual(["cliproxyapi/model-a", "model-y"]);
   });
 });
 
@@ -65,14 +58,14 @@ describe("buildSlimConfig – preset and global override semantics", () => {
   const available = ["model-a", "model-b"];
 
   it("should use overrides.preset for active preset selection", () => {
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       preset: "custom",
       presets: {
         custom: {
-          orchestrator: { model: "model-a" },
+          agents: { orchestrator: { model: "model-a" } },
         },
         cliproxyapi: {
-          orchestrator: { model: "model-b" },
+          agents: { orchestrator: { model: "model-b" } },
         },
       },
     }, { presetName: "cliproxyapi" });
@@ -83,18 +76,18 @@ describe("buildSlimConfig – preset and global override semantics", () => {
   });
 
   it("should fall back to options.presetName when overrides.preset is missing", () => {
-    const config = buildSlimConfig(available, {}, { presetName: "fallback" });
+    const config = buildSlimConfigChecked(available, {}, { presetName: "fallback" });
 
     const generated = expectGeneratedConfig(config);
     expect(generated.preset).toBe("fallback");
   });
 
   it("should prioritize root agents over preset agents (upstream semantics)", () => {
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       preset: "test",
       presets: {
         test: {
-          orchestrator: { model: "model-a", variant: "preset" },
+          agents: { orchestrator: { model: "model-a", variant: "preset" } },
         },
       },
       agents: {
@@ -115,7 +108,7 @@ describe("buildSlimConfig – preset and global override semantics", () => {
   });
 
   it("should preserve explicit advanced agent configs", () => {
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       agents: {
         observer: { model: "external/observer-model" },
         councillor: { model: "model-a" },
@@ -134,11 +127,11 @@ describe("buildSlimConfig – preset and global override semantics", () => {
   });
 
   it("preserves partial root overrides without inventing a new model", () => {
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       preset: "test",
       presets: {
         test: {
-          oracle: { model: "model-a" },
+          agents: { oracle: { model: "model-a" } },
         },
       },
       agents: {
@@ -151,8 +144,8 @@ describe("buildSlimConfig – preset and global override semantics", () => {
     expect(generated.agents?.oracle).toEqual({ variant: "high" });
   });
 
-  it("preserves council master overrides without a model", () => {
-    const config = buildSlimConfig(available, {
+  it("emits council presets but not the master slim 3.x removed", () => {
+    const config = buildSlimConfigChecked(available, validateSlimConfig({
       council: {
         master: {
           variant: "high-precision",
@@ -166,18 +159,16 @@ describe("buildSlimConfig – preset and global override semantics", () => {
           },
         },
       },
-    });
+    }));
 
     const generated = expectGeneratedConfig(config);
-    expect(generated.council).toBeDefined();
-    expect(generated.council?.master).toEqual({
-      variant: "high-precision",
-      prompt: "Coordinate the council.",
+    expect(generated.council).toEqual({
+      presets: { default: { alpha: { model: "cliproxyapi/model-a" } } },
     });
   });
 
   it("should handle disabled_agents field", () => {
-    const config = buildSlimConfig(available, {
+    const config = buildSlimConfigChecked(available, {
       disabled_agents: ["observer", "councillor"],
     });
 

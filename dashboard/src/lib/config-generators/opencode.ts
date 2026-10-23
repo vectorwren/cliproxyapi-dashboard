@@ -1,8 +1,10 @@
+import { isRecord } from "@/lib/utils";
+import { normalizePlugin, OMO_PLUGIN, SYNC_PLUGIN } from "./upstream/plugins";
 import {
-  isRecord,
   type ProxyModel,
 } from "./shared";
 import { modelsDevCache, CACHE_TTL, CACHE_KEYS } from "@/lib/cache";
+import { getConfiguredManagementUrl, getManagementUrl } from "@/lib/management-url";
 
 export type { OAuthAccount, ConfigData } from "./shared";
 
@@ -12,7 +14,8 @@ export function getProxyUrl(): string {
     return apiUrl;
   }
 
-  const managementUrl = process.env.CLIPROXYAPI_MANAGEMENT_URL?.trim();
+  // Client-facing URL: empty when unset, never the internal Docker default.
+  const managementUrl = getConfiguredManagementUrl();
   if (!managementUrl) {
     return "";
   }
@@ -26,7 +29,7 @@ export function getProxyUrl(): string {
 }
 
 export function getInternalProxyUrl(): string {
-  const managementUrl = process.env.CLIPROXYAPI_MANAGEMENT_URL || "http://cliproxyapi:8317/v0/management";
+  const managementUrl = getManagementUrl();
   try {
     const url = new URL(managementUrl);
     return `${url.protocol}//${url.host}`;
@@ -348,10 +351,7 @@ export function generateConfigJson(
    }
    const configModel = resolveConfigModel(models, options);
  
-   const plugins = options?.plugins ?? [
-     "opencode-cliproxyapi-sync@latest",
-     "oh-my-openagent@latest",
-   ];
+   const plugins = Array.from(new Set((options?.plugins ?? [SYNC_PLUGIN, OMO_PLUGIN]).map(normalizePlugin)));
  
    const configObj: Record<string, unknown> = {
      $schema: "https://opencode.ai/config.json",

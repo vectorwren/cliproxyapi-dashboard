@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { prisma } from "@/lib/db";
+import { getManagementUrl } from "@/lib/management-url";
 import { buildAvailableModelsFromProxy, extractOAuthModelAliases, fetchModelsDevLimits, getProxyUrl, getInternalProxyUrl, inferModelDefinition, type McpEntry, type ModelDefinition } from "@/lib/config-generators/opencode";
 import { buildOhMyOpenCodeConfig } from "@/lib/config-generators/oh-my-opencode";
 import { buildSlimConfig } from "@/lib/config-generators/oh-my-opencode-slim";
@@ -9,6 +10,8 @@ import { validateSlimConfig, type OhMyOpenCodeSlimFullConfig } from "@/lib/confi
 import type { ConfigData, OAuthAccount } from "@/lib/config-generators/shared";
 import { proxyModelsCache, CACHE_TTL, CACHE_KEYS } from "@/lib/cache";
 import { fetchWithRetry } from "@/lib/fetch-utils";
+import { isRecord } from "@/lib/utils";
+import { resolvePluginList } from "@/lib/config-generators/upstream/plugins";
 
 async function fetchProxyModelsCached(proxyUrl: string, apiKey: string): Promise<ProxyModel[]> {
   const cacheKey = CACHE_KEYS.proxyModels(proxyUrl, apiKey);
@@ -39,9 +42,6 @@ function stableStringify(obj: unknown): string {
   return "{" + pairs.join(",") + "}";
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function readStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
@@ -85,9 +85,7 @@ function getFrozenOverrides(frozenConfig: unknown): OhMyOpenCodeFullConfig | und
 
 async function fetchManagementJson({ path }: ManagementFetchParams) {
   try {
-    const baseUrl =
-      process.env.CLIPROXYAPI_MANAGEMENT_URL ||
-      "http://cliproxyapi:8317/v0/management";
+    const baseUrl = getManagementUrl();
     const res = await fetchWithRetry(`${baseUrl}/${path}`, {
       method: "GET",
       headers: {
@@ -359,15 +357,7 @@ export async function generateConfigBundle(userId: string, syncApiKey?: string |
     const customPlugins = agentOverrides?.customPlugins ?? [];
     const defaultModelOverride = agentOverrides?.defaultModel?.trim();
    
-   // Use slim plugin if user's customPlugins include it, otherwise default to normal
-   const hasSlimPlugin = customPlugins.includes("oh-my-opencode-slim@latest");
-   const omoPlugin = hasSlimPlugin ? "oh-my-opencode-slim@latest" : "oh-my-openagent@latest";
-   const defaultPlugins = ["opencode-cliproxyapi-sync@latest", omoPlugin];
-   const pluginSet = new Set([...defaultPlugins, ...customPlugins]);
-   // Ensure both variants aren't included simultaneously
-   if (hasSlimPlugin) pluginSet.delete("oh-my-openagent@latest");
-   else pluginSet.delete("oh-my-opencode-slim@latest");
-   const plugins = Array.from(pluginSet).sort();
+   const plugins = resolvePluginList(customPlugins);
 
    const providers: Record<string, Record<string, unknown>> = {
      cliproxyapi: {

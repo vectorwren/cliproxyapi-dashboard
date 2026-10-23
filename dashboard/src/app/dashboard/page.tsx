@@ -5,15 +5,19 @@ import { QuickStartConfigSection } from "@/components/quick-start-config-section
 import { ConfigPublisher } from "@/components/config-publisher";
 import { ConfigSubscriber } from "@/components/config-subscriber";
 import { verifySession } from "@/lib/auth/session";
+import { getManagementUrl, getProxyBaseUrl } from "@/lib/management-url";
 import { prisma } from "@/lib/db";
-import type { OhMyOpenCodeFullConfig } from "@/lib/config-generators/oh-my-opencode-types";
+import { validateFullConfig, type OhMyOpenCodeFullConfig } from "@/lib/config-generators/oh-my-opencode-types";
 import { validateSlimConfig, type OhMyOpenCodeSlimFullConfig } from "@/lib/config-generators/oh-my-opencode-slim-types";
 import { buildAvailableModelIds, fetchProxyModels } from "@/lib/config-generators/shared";
 import { getProxyUrl, getInternalProxyUrl, buildAvailableModelsFromProxy, extractOAuthModelAliases, fetchModelsDevLimits, inferModelDefinition } from "@/lib/config-generators/opencode";
 import type { ConfigData } from "@/lib/config-generators/shared";
 import { resolveOwnedByDisplay } from "@/lib/providers/model-grouping";
 import { LazyDashboardMiniCharts } from "@/components/lazy-dashboard-mini-charts";
+import { OmoSettingsNotice } from "@/components/omo-settings-notice";
+import { shouldShowOmoSettingsNotice } from "@/lib/config-generators/upstream/plugins";
 import { getTranslations } from 'next-intl/server';
+import { PROVIDER_CONFIG_KEYS } from "@/lib/providers/constants";
 
 interface ManagementFetchParams {
   path: string;
@@ -21,9 +25,7 @@ interface ManagementFetchParams {
 
 async function fetchManagementJson({ path }: ManagementFetchParams) {
   try {
-    const baseUrl =
-      process.env.CLIPROXYAPI_MANAGEMENT_URL ||
-      "http://cliproxyapi:8317/v0/management";
+    const baseUrl = getManagementUrl();
     const res = await fetch(`${baseUrl}/${path}`, {
       headers: {
         Authorization: `Bearer ${process.env.MANAGEMENT_API_KEY}`,
@@ -39,10 +41,7 @@ async function fetchManagementJson({ path }: ManagementFetchParams) {
 
 async function getServiceHealth() {
   try {
-    const baseUrl =
-      process.env.CLIPROXYAPI_MANAGEMENT_URL ||
-      "http://cliproxyapi:8317/v0/management";
-    const root = baseUrl.replace(/\/v0\/management\/?$/, "/");
+    const root = `${getProxyBaseUrl()}/`;
     const res = await fetch(root, { cache: "no-store" });
     return res.ok;
   } catch {
@@ -155,11 +154,17 @@ export default async function QuickStartPage() {
     : (modelPreference?.excludedModels ?? []);
   
   // Use publisher's overrides for model selection, but keep subscriber's MCPs
-  const publisherOverrides = (publisherAgentOverride?.overrides ?? {}) as OhMyOpenCodeFullConfig;
-  const subscriberOverrides = (agentOverride?.overrides ?? {}) as OhMyOpenCodeFullConfig;
+  const publisherOverrides = validateFullConfig(publisherAgentOverride?.overrides);
+  const subscriberOverrides = validateFullConfig(agentOverride?.overrides);
   const agentOverrides: OhMyOpenCodeFullConfig = isSubscriber
     ? { ...publisherOverrides, mcpServers: subscriberOverrides.mcpServers, customPlugins: subscriberOverrides.customPlugins }
     : subscriberOverrides;
+  // Same plugin merge as the sync bundle: subscribers get publisher plugins plus their own.
+  // ponytail: ignores backup-imported frozenConfig (rare); reuse the bundle's merge if that matters.
+  const syncedPlugins = isSubscriber
+    ? [...(publisherOverrides.customPlugins ?? []), ...(subscriberOverrides.customPlugins ?? [])]
+    : subscriberOverrides.customPlugins;
+  const showOmoNotice = session !== null && shouldShowOmoSettingsNotice(syncedPlugins, hasSyncActive);
 
   // Slim overrides — validate from DB, subscriber inherits publisher's if non-empty
   const publisherSlimOverrides = publisherAgentOverride?.slimOverrides
@@ -175,15 +180,7 @@ export default async function QuickStartPage() {
   const apiKeys = userApiKeys.map((k) => ({ key: k.key, name: k.name }));
   const oauthAccounts = extractOAuthAccounts(oauthData);
 
-  const providerKeys = [
-    "gemini-api-key",
-    "claude-api-key",
-    "codex-api-key",
-    "xai-api-key",
-    "vertex-api-key",
-    "openai-compatibility",
-  ];
-  const configProviderCount = providerKeys.filter((key) => {
+  const configProviderCount = PROVIDER_CONFIG_KEYS.filter((key) => {
     const value = config?.[key];
     if (Array.isArray(value)) return value.length > 0;
     return Boolean(value);
@@ -344,6 +341,8 @@ export default async function QuickStartPage() {
           </div>
         </div>
       </section>
+
+      {showOmoNotice && <OmoSettingsNotice userId={session.userId} />}
 
       <section id="overview" className="scroll-mt-24">
         <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-2">

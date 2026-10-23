@@ -5,6 +5,8 @@
  * oh-my-opencode optional configuration sections.
  */
 
+import { boundedObject, boundedStrings, isRecord, oneOf } from "@/lib/utils";
+
 import type { McpEntry } from "./opencode";
 
 // ============================================================================
@@ -17,6 +19,7 @@ export interface TmuxConfig {
   main_pane_size?: number;
   main_pane_min_width?: number;
   agent_pane_min_width?: number;
+  isolation?: (typeof TMUX_ISOLATIONS)[number];
 }
 
 export interface BackgroundTaskConfig {
@@ -24,10 +27,13 @@ export interface BackgroundTaskConfig {
   staleTimeoutMs?: number;
   providerConcurrency?: Record<string, number>;
   modelConcurrency?: Record<string, number>;
+  maxLiveDescendantsPerRoot?: number;
+  taskCleanupDelayMs?: number;
 }
 
 export interface BrowserAutomationConfig {
   provider?: string;
+  playwright_mcp_args?: string[];
 }
 
 export interface SisyphusAgentConfig {
@@ -35,6 +41,7 @@ export interface SisyphusAgentConfig {
   default_builder_enabled?: boolean;
   planner_enabled?: boolean;
   replace_plan?: boolean;
+  tdd?: boolean;
 }
 
 export interface GitMasterConfig {
@@ -42,48 +49,53 @@ export interface GitMasterConfig {
   include_co_authored_by?: boolean;
 }
 
-export interface LspEntry {
-  command: string[];
-  extensions?: string[];
-}
+export type PermissionValue = "ask" | "allow" | "deny";
 
 export interface AgentPermissionConfig {
-  edit?: "allow" | "deny" | "prompt";
-  bash?: { git?: "allow" | "deny" | "prompt"; test?: "allow" | "deny" | "prompt" } | "allow" | "deny" | "prompt";
-}
-
-export interface AgentThinkingConfig {
-  type: "enabled" | "disabled";
-  budgetTokens?: number;
+  edit?: PermissionValue;
+  bash?: { git?: PermissionValue; test?: PermissionValue } | PermissionValue;
+  webfetch?: PermissionValue;
+  task?: PermissionValue;
+  doom_loop?: PermissionValue;
+  external_directory?: PermissionValue;
 }
 
 export interface AgentUltraworkConfig {
   model?: string;
-  variant?: string;
-  temperature?: number;
+  reasoning?: string;
 }
 
+/**
+ * Stored overrides. `fallback_models` is the stored fallback list only; the generator emits it as the
+ * tail of upstream's `models` chain. Legacy `variant`/`thinking` are translated by `validateFullConfig`.
+ */
 export interface AgentConfigEntry {
   model?: string;
-  variant?: string;
+  reasoning?: string;
   temperature?: number;
   prompt_append?: string;
   fallback_models?: string[];
   permission?: AgentPermissionConfig;
-  thinking?: AgentThinkingConfig;
+  providerOptions?: Record<string, unknown>;
   ultrawork?: AgentUltraworkConfig;
+  displayName?: string;
 }
 
 export interface CategoryConfigEntry {
   model?: string;
-  variant?: string;
+  reasoning?: string;
   temperature?: number;
   description?: string;
   fallback_models?: string[];
+  max_tokens?: number;
+  provider_options?: Record<string, unknown>;
+  warn_unavailable?: boolean;
 }
+
 export interface ExperimentalConfig {
   aggressive_truncation?: boolean;
   task_system?: boolean;
+  disable_live_parent_wake_routing?: boolean;
 }
 
 export interface OhMyOpenCodeFullConfig {
@@ -100,13 +112,46 @@ export interface OhMyOpenCodeFullConfig {
   browser_automation_engine?: BrowserAutomationConfig;
   sisyphus_agent?: SisyphusAgentConfig;
   git_master?: GitMasterConfig;
-  lsp?: Record<string, LspEntry>;
   mcpServers?: McpEntry[];
   customPlugins?: string[];
   configSchemaVersion?: number;
   hashline_edit?: boolean;
   experimental?: ExperimentalConfig;
+  agent_order?: string[];
+  agent_definitions?: string[];
+  disabled_providers?: string[];
+  telemetry?: boolean;
+  // ponytail: kept as opaque objects (size-bounded, not validated field by field); add typed
+  // validators when the dashboard grows UI for them.
+  goal?: Record<string, unknown>;
+  i18n?: Record<string, unknown>;
+  monitor?: Record<string, unknown>;
+  team_mode?: Record<string, unknown>;
+  keyword_detector?: Record<string, unknown>;
+  tui?: Record<string, unknown>;
+  ulw_execute?: Record<string, unknown>;
+  default_mode?: Record<string, unknown>;
 }
+
+const OPAQUE_KEYS = [
+  "goal",
+  "i18n",
+  "monitor",
+  "team_mode",
+  "keyword_detector",
+  "tui",
+  "ulw_execute",
+  "default_mode",
+] as const satisfies readonly (keyof OhMyOpenCodeFullConfig)[];
+
+/** Top-level keys the generator copies to the output unchanged. */
+export const OMO_PASSTHROUGH_KEYS = [
+  "agent_order",
+  "agent_definitions",
+  "disabled_providers",
+  "telemetry",
+  ...OPAQUE_KEYS,
+] as const satisfies readonly (keyof OhMyOpenCodeFullConfig)[];
 
 // ============================================================================
 // PRESETS
@@ -136,17 +181,33 @@ export const AVAILABLE_AGENTS = [
   "sisyphus-junior",
 ] as const;
 
+/** OMO 5.1.33 built-in skills; `disabled_skills` also takes any other skill name. */
 export const AVAILABLE_SKILLS = [
   "playwright",
-  "agent-browser",
-  "frontend-ui-ux",
+  "dev-browser",
+  "frontend",
   "git-master",
+  "review-work",
+  "remove-ai-slops",
+  "init-deep",
+  "debugging",
+  "security-research",
+  "security-review",
+  "visual-qa",
+  "team-mode",
 ] as const;
 
+/** OMO 5.x `disabled_commands` enum; any other value fails upstream schema validation. */
 export const AVAILABLE_COMMANDS = [
-  "init-deep",
-  "start-work",
+  "goal",
+  "refactor",
+  "ulw-execute",
+  "stop-continuation",
+  "remove-ai-slops",
+  "hyperplan",
 ] as const;
+
+export const TMUX_ISOLATIONS = ["inline", "window", "session"] as const;
 
 export const TMUX_LAYOUTS = [
   "main-vertical",
@@ -156,69 +217,92 @@ export const TMUX_LAYOUTS = [
   "even-vertical",
 ] as const;
 
+/** OMO 5.x `browser_automation_engine.provider` enum. */
 export const BROWSER_PROVIDERS = [
   "playwright",
-  "agent-browser",
+  "dev-browser",
+  "playwright-cli",
 ] as const;
 
-// ============================================================================
-// HOOK_GROUPS - Hooks grouped by functionality
-// ============================================================================
+/** Names OMO 5.x no longer has; stored legacy values are dropped so they are never emitted. */
+const REMOVED_SKILLS = new Set(["agent-browser", "frontend-ui-ux"]);
+const REMOVED_HOOKS = new Set([
+  "context-window-monitor",
+  "session-recovery",
+  "thinking-block-validator",
+  "grep-output-truncator",
+  "ralph-loop",
+  "start-work",
+]);
 
-export const HOOK_GROUPS = {
-  context: [
-    "context-window-monitor",
-    "compaction-context-injector",
-    "preemptive-compaction",
-  ],
-  recovery: [
-    "session-recovery",
-    "anthropic-context-window-limit-recovery",
-    "edit-error-recovery",
-    "delegate-task-retry",
-  ],
-  notification: [
-    "session-notification",
-    "background-notification",
-    "startup-toast",
-    "auto-update-checker",
-  ],
-  validation: [
-    "comment-checker",
-    "thinking-block-validator",
-    "empty-task-response-detector",
-  ],
-  output: [
-    "grep-output-truncator",
-    "tool-output-truncator",
-  ],
-  injection: [
-    "directory-agents-injector",
-    "directory-readme-injector",
-    "rules-injector",
-  ],
-  automation: [
-    "todo-continuation-enforcer",
-    "keyword-detector",
-    "agent-usage-reminder",
-    "auto-slash-command",
-    "ralph-loop",
-    "start-work",
-  ],
-  environment: [
-    "non-interactive-env",
-    "interactive-bash-session",
-    "think-mode",
-    "claude-code-hooks",
-  ],
-  planning: [
-    "prometheus-md-only",
-    "sisyphus-junior-notepad",
-    "atlas",
-  ],
-} as const;
+export { HOOK_GROUPS, type HookGroupName } from "./oh-my-opencode-hooks";
 
-export type HookGroupName = keyof typeof HOOK_GROUPS;
+/** OMO 5.x renamed `deep` to `deep-low`; an explicitly stored `deep-low` wins over a legacy `deep`. */
+export function canonicalizeCategories<T>(
+  categories: Record<string, T> | undefined,
+): Record<string, T> | undefined {
+  if (!categories || !("deep" in categories)) return categories;
+  const { deep, ...rest } = categories;
+  return { "deep-low": deep, ...rest };
+}
+
+/** Reads a stored permission value; legacy `prompt` (never valid upstream) becomes `ask`. */
+function readPermissionValue(value: unknown): PermissionValue | undefined {
+  if (value === "prompt") return "ask";
+  return value === "ask" || value === "allow" || value === "deny" ? value : undefined;
+}
+
+/** Reads a stored agent permission block, dropping invalid values. */
+function readPermissionConfig(value: unknown): AgentPermissionConfig | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const permission: AgentPermissionConfig = {};
+  for (const key of ["edit", "webfetch", "task", "doom_loop", "external_directory"] as const) {
+    const rule = readPermissionValue(value[key]);
+    if (rule) permission[key] = rule;
+  }
+
+  const bash = readPermissionValue(value.bash);
+  if (bash) {
+    permission.bash = bash;
+  } else if (isRecord(value.bash)) {
+    const bashPermission: NonNullable<Exclude<AgentPermissionConfig["bash"], string>> = {};
+    const git = readPermissionValue(value.bash.git);
+    if (git) {
+      bashPermission.git = git;
+    }
+    const test = readPermissionValue(value.bash.test);
+    if (test) {
+      bashPermission.test = test;
+    }
+    if (Object.keys(bashPermission).length > 0) {
+      permission.bash = bashPermission;
+    }
+  }
+
+  return Object.keys(permission).length > 0 ? permission : undefined;
+}
+
+/** Canonical `reasoning`, else the deprecated `variant`, else `off` for a disabled legacy `thinking` (as upstream migrates). */
+function readReasoning(entry: Record<string, unknown>): string | undefined {
+  if (typeof entry.reasoning === "string") return entry.reasoning;
+  if (typeof entry.variant === "string") return entry.variant;
+  return isRecord(entry.thinking) && entry.thinking.type === "disabled" ? "off" : undefined;
+}
+
+/** `providerOptions`, with an enabled legacy `thinking` block moved under it (upstream's replacement). */
+function readProviderOptions(entry: Record<string, unknown>): Record<string, unknown> | undefined {
+  const options: Record<string, unknown> = isRecord(entry.providerOptions) ? { ...entry.providerOptions } : {};
+  const thinking = entry.thinking;
+  if (isRecord(thinking) && thinking.type === "enabled" && options.thinking === undefined) {
+    options.thinking = typeof thinking.budgetTokens === "number" && thinking.budgetTokens >= 0
+      ? { type: "enabled", budgetTokens: thinking.budgetTokens }
+      : { type: "enabled" };
+  }
+  return Object.keys(options).length > 0 ? options : undefined;
+}
 
 // ============================================================================
 // VALIDATION FUNCTION
@@ -244,7 +328,8 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
         const entryObj = value as Record<string, unknown>;
         const entry: AgentConfigEntry = {};
         if (typeof entryObj.model === "string") entry.model = entryObj.model;
-        if (typeof entryObj.variant === "string") entry.variant = entryObj.variant;
+        const reasoning = readReasoning(entryObj);
+        if (reasoning) entry.reasoning = reasoning;
         if (typeof entryObj.temperature === "number" && entryObj.temperature >= 0 && entryObj.temperature <= 2) {
           entry.temperature = entryObj.temperature;
         }
@@ -253,70 +338,19 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
           const fallbacks = entryObj.fallback_models.filter((v: unknown): v is string => typeof v === "string");
           if (fallbacks.length > 0) entry.fallback_models = fallbacks;
         }
-        if (entryObj.permission && typeof entryObj.permission === "object" && !Array.isArray(entryObj.permission)) {
-          const permissionObj = entryObj.permission as Record<string, unknown>;
-          const permission: AgentPermissionConfig = {};
-
-          if (
-            permissionObj.edit === "allow" ||
-            permissionObj.edit === "deny" ||
-            permissionObj.edit === "prompt"
-          ) {
-            permission.edit = permissionObj.edit;
-          }
-
-          if (
-            permissionObj.bash === "allow" ||
-            permissionObj.bash === "deny" ||
-            permissionObj.bash === "prompt"
-          ) {
-            permission.bash = permissionObj.bash;
-          } else if (
-            permissionObj.bash &&
-            typeof permissionObj.bash === "object" &&
-            !Array.isArray(permissionObj.bash)
-          ) {
-            const bashObj = permissionObj.bash as Record<string, unknown>;
-            const bashPermission: NonNullable<Exclude<AgentPermissionConfig["bash"], string>> = {};
-            if (bashObj.git === "allow" || bashObj.git === "deny" || bashObj.git === "prompt") {
-              bashPermission.git = bashObj.git;
-            }
-            if (bashObj.test === "allow" || bashObj.test === "deny" || bashObj.test === "prompt") {
-              bashPermission.test = bashObj.test;
-            }
-            if (Object.keys(bashPermission).length > 0) {
-              permission.bash = bashPermission;
-            }
-          }
-
-          if (Object.keys(permission).length > 0) {
-            entry.permission = permission;
-          }
-        }
-        if (entryObj.thinking && typeof entryObj.thinking === "object" && !Array.isArray(entryObj.thinking)) {
-          const thinkingObj = entryObj.thinking as Record<string, unknown>;
-          if (thinkingObj.type === "enabled" || thinkingObj.type === "disabled") {
-            const thinking: AgentThinkingConfig = { type: thinkingObj.type };
-            if (typeof thinkingObj.budgetTokens === "number" && thinkingObj.budgetTokens >= 0) {
-              thinking.budgetTokens = thinkingObj.budgetTokens;
-            }
-            entry.thinking = thinking;
-          }
-        }
-        if (entryObj.ultrawork && typeof entryObj.ultrawork === "object" && !Array.isArray(entryObj.ultrawork)) {
-          const ultraworkObj = entryObj.ultrawork as Record<string, unknown>;
+        const permission = readPermissionConfig(entryObj.permission);
+        if (permission) entry.permission = permission;
+        const providerOptions = readProviderOptions(entryObj);
+        if (providerOptions) entry.providerOptions = providerOptions;
+        // ultrawork.temperature is not in the OMO 5.x schema, so a stored one is dropped.
+        if (isRecord(entryObj.ultrawork)) {
           const ultrawork: AgentUltraworkConfig = {};
-          if (typeof ultraworkObj.model === "string") ultrawork.model = ultraworkObj.model;
-          if (typeof ultraworkObj.variant === "string") ultrawork.variant = ultraworkObj.variant;
-          if (
-            typeof ultraworkObj.temperature === "number" &&
-            ultraworkObj.temperature >= 0 &&
-            ultraworkObj.temperature <= 2
-          ) {
-            ultrawork.temperature = ultraworkObj.temperature;
-          }
+          if (typeof entryObj.ultrawork.model === "string") ultrawork.model = entryObj.ultrawork.model;
+          const ultraworkReasoning = readReasoning(entryObj.ultrawork);
+          if (ultraworkReasoning) ultrawork.reasoning = ultraworkReasoning;
           if (Object.keys(ultrawork).length > 0) entry.ultrawork = ultrawork;
         }
+        if (typeof entryObj.displayName === "string" && entryObj.displayName) entry.displayName = entryObj.displayName;
         validatedAgents[key] = entry;
       }
     }
@@ -348,7 +382,8 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
         const entryObj = value as Record<string, unknown>;
         const entry: CategoryConfigEntry = {};
         if (typeof entryObj.model === "string") entry.model = entryObj.model;
-        if (typeof entryObj.variant === "string") entry.variant = entryObj.variant;
+        const reasoning = readReasoning(entryObj);
+        if (reasoning) entry.reasoning = reasoning;
         if (typeof entryObj.temperature === "number" && entryObj.temperature >= 0 && entryObj.temperature <= 2) {
           entry.temperature = entryObj.temperature;
         }
@@ -357,11 +392,17 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
           const fallbacks = entryObj.fallback_models.filter((v: unknown): v is string => typeof v === "string");
           if (fallbacks.length > 0) entry.fallback_models = fallbacks;
         }
+        if (Number.isSafeInteger(entryObj.max_tokens) && (entryObj.max_tokens as number) > 0) {
+          entry.max_tokens = entryObj.max_tokens as number;
+        }
+        const providerOptions = boundedObject(entryObj.provider_options);
+        if (providerOptions) entry.provider_options = providerOptions;
+        if (typeof entryObj.warn_unavailable === "boolean") entry.warn_unavailable = entryObj.warn_unavailable;
         validatedCategories[key] = entry;
       }
     }
     if (Object.keys(validatedCategories).length > 0) {
-      result.categories = validatedCategories;
+      result.categories = canonicalizeCategories(validatedCategories);
     }
   }
 
@@ -375,21 +416,21 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
   // Validate disabled_skills array
   if (Array.isArray(obj.disabled_skills)) {
     result.disabled_skills = obj.disabled_skills.filter(
-      (v): v is string => typeof v === "string"
+      (v): v is string => typeof v === "string" && !REMOVED_SKILLS.has(v)
     );
   }
 
   // Validate disabled_hooks array
   if (Array.isArray(obj.disabled_hooks)) {
     result.disabled_hooks = obj.disabled_hooks.filter(
-      (v): v is string => typeof v === "string"
+      (v): v is string => typeof v === "string" && !REMOVED_HOOKS.has(v)
     );
   }
 
   // Validate disabled_commands array
   if (Array.isArray(obj.disabled_commands)) {
     result.disabled_commands = obj.disabled_commands.filter(
-      (v): v is string => typeof v === "string"
+      (v): v is string => typeof v === "string" && (AVAILABLE_COMMANDS as readonly string[]).includes(v)
     );
   }
 
@@ -425,6 +466,9 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
       tmuxConfig.agent_pane_min_width = tmuxObj.agent_pane_min_width;
     }
 
+    const isolation = oneOf(tmuxObj.isolation, TMUX_ISOLATIONS);
+    if (isolation) tmuxConfig.isolation = isolation;
+
     if (Object.keys(tmuxConfig).length > 0) {
       result.tmux = tmuxConfig;
     }
@@ -445,6 +489,14 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
 
     if (typeof bgObj.staleTimeoutMs === "number") {
       bgConfig.staleTimeoutMs = bgObj.staleTimeoutMs;
+    }
+
+    if (Number.isSafeInteger(bgObj.maxLiveDescendantsPerRoot) && (bgObj.maxLiveDescendantsPerRoot as number) >= 0) {
+      bgConfig.maxLiveDescendantsPerRoot = bgObj.maxLiveDescendantsPerRoot as number;
+    }
+
+    if (typeof bgObj.taskCleanupDelayMs === "number" && bgObj.taskCleanupDelayMs >= 60000) {
+      bgConfig.taskCleanupDelayMs = bgObj.taskCleanupDelayMs;
     }
 
     // Validate providerConcurrency as Record<string, number>
@@ -497,9 +549,12 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
     const browserObj = obj.browser_automation_engine as Record<string, unknown>;
     const browserConfig: BrowserAutomationConfig = {};
 
-    if (typeof browserObj.provider === "string") {
+    if (typeof browserObj.provider === "string" && (BROWSER_PROVIDERS as readonly string[]).includes(browserObj.provider)) {
       browserConfig.provider = browserObj.provider;
     }
+
+    const playwrightMcpArgs = boundedStrings(browserObj.playwright_mcp_args);
+    if (playwrightMcpArgs?.length) browserConfig.playwright_mcp_args = playwrightMcpArgs;
 
     if (Object.keys(browserConfig).length > 0) {
       result.browser_automation_engine = browserConfig;
@@ -531,6 +586,10 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
       sisyphusConfig.replace_plan = sisyphusObj.replace_plan;
     }
 
+    if (typeof sisyphusObj.tdd === "boolean") {
+      sisyphusConfig.tdd = sisyphusObj.tdd;
+    }
+
     if (Object.keys(sisyphusConfig).length > 0) {
       result.sisyphus_agent = sisyphusConfig;
     }
@@ -557,42 +616,6 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
       result.git_master = gitConfig;
     }
   }
-
-   // Validate lsp config
-   if (
-     obj.lsp &&
-     typeof obj.lsp === "object" &&
-     !Array.isArray(obj.lsp)
-   ) {
-     const lspObj = obj.lsp as Record<string, unknown>;
-     const lspConfig: Record<string, LspEntry> = {};
-
-     for (const [key, value] of Object.entries(lspObj)) {
-       if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-       const entryObj = value as Record<string, unknown>;
-
-       // Validate required command field
-       if (!Array.isArray(entryObj.command)) continue;
-       const command = entryObj.command.filter((c): c is string => typeof c === "string");
-       if (command.length === 0) continue;
-
-       const entry: LspEntry = { command };
-
-       // Validate optional extensions field
-       if (Array.isArray(entryObj.extensions)) {
-         const extensions = entryObj.extensions.filter((e): e is string => typeof e === "string");
-         if (extensions.length > 0) {
-           entry.extensions = extensions;
-         }
-       }
-
-       lspConfig[key] = entry;
-     }
-
-     if (Object.keys(lspConfig).length > 0) {
-       result.lsp = lspConfig;
-     }
-   }
 
    if (Array.isArray(obj.mcpServers)) {
      const mcpServers: McpEntry[] = [];
@@ -680,9 +703,32 @@ export function validateFullConfig(raw: unknown): OhMyOpenCodeFullConfig {
        experimental.task_system = experimentalObj.task_system;
      }
 
+     if (typeof experimentalObj.disable_live_parent_wake_routing === "boolean") {
+       experimental.disable_live_parent_wake_routing = experimentalObj.disable_live_parent_wake_routing;
+     }
+
      if (Object.keys(experimental).length > 0) {
        result.experimental = experimental;
      }
+   }
+
+   for (const key of ["agent_definitions", "disabled_providers"] as const) {
+     const list = boundedStrings(obj[key])?.filter((v) => v.length > 0);
+     if (list?.length) result[key] = list;
+   }
+
+   if (Array.isArray(obj.agent_order)) {
+     // Upstream caps agent_order at 64 names of at most 128 chars.
+     const agentOrder = obj.agent_order.slice(0, 64)
+       .filter((v): v is string => typeof v === "string" && v.length > 0 && v.length <= 128);
+     if (agentOrder.length > 0) result.agent_order = agentOrder;
+   }
+
+   if (typeof obj.telemetry === "boolean") result.telemetry = obj.telemetry;
+
+   for (const key of OPAQUE_KEYS) {
+     const value = boundedObject(obj[key]);
+     if (value) result[key] = value;
    }
 
    return result;

@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { timingSafeEqual } from "crypto";
 import { verifySession } from "@/lib/auth/session";
+import { getManagementUrl } from "@/lib/management-url";
 import { logger } from "@/lib/logger";
 import { quotaCache, CACHE_TTL } from "@/lib/cache";
 import { Errors } from "@/lib/errors";
 import {
   ANTIGRAVITY_QUOTA_ENDPOINTS,
   ANTIGRAVITY_SUMMARY_ENDPOINTS,
+  ANTIGRAVITY_USER_AGENT,
   enrichModelFirstGroup,
   isModelFirstProvider,
   normalizeFraction,
@@ -15,10 +17,10 @@ import {
   type QuotaGroup,
   type QuotaResponse,
 } from "@/lib/model-first-monitoring";
+import { parseCodexQuota, type CodexWhamUsageResponse } from "@/lib/quota/codex";
+import { slugifyLabel } from "@/lib/quota/labels";
 
-const CLIPROXYAPI_MANAGEMENT_URL =
-  process.env.CLIPROXYAPI_MANAGEMENT_URL ||
-  "http://cliproxyapi:8317/v0/management";
+const CLIPROXYAPI_MANAGEMENT_URL = getManagementUrl();
 const MANAGEMENT_API_KEY = process.env.MANAGEMENT_API_KEY;
 
 interface AuthFile {
@@ -32,6 +34,8 @@ interface AuthFile {
   label?: string;
   disabled: boolean;
   status: string;
+  /** Claims CLIProxyAPI decodes from a Codex auth file's stored id_token. */
+  id_token?: { chatgpt_account_id?: string };
 }
 
 interface AuthFilesResponse {
@@ -73,6 +77,8 @@ function inferProviderFromAuthFile(account: AuthFile): string | null {
     if (candidate.includes("codex-")) return "codex";
     if (candidate.includes("gemini-cli") || candidate.includes("gemini-")) return "gemini-cli";
     if (candidate.includes("antigravity-")) return "antigravity";
+    // kimi.ai first: "kimi-" also matches "kimi-ai-" (upstream kimi.go resolves the same way)
+    if (candidate.includes("kimi-ai") || candidate.includes("kimi.ai")) return "kimi-ai";
     if (candidate.includes("kimi-")) return "kimi";
     if (candidate.includes("github-copilot") || candidate.includes("copilot-")) return "copilot";
     if (candidate.includes("github-")) return "github";
@@ -237,6 +243,31 @@ interface AntigravityQuotaSummary {
   }>;
 }
 
+// Output order: shared Gemini, then the Pro-only Argon pool, then Claude/GPT.
+const ANTIGRAVITY_FAMILY_LABELS = {
+  gemini: "Gemini",
+  "gemini-argon": "Gemini 4 Argon",
+  "claude-gpt": "Claude/GPT",
+} as const;
+type AntigravityFamily = keyof typeof ANTIGRAVITY_FAMILY_LABELS;
+
+// The bucketId decides the family: "Gemini 4 Argon" also contains "gemini" and must not
+// land in the shared Gemini windows. The display name is only used for buckets without one.
+function antigravityFamily(bucketId: string | undefined, displayName: string): AntigravityFamily | null {
+  const id = bucketId?.toLowerCase();
+  if (id) {
+    if (id.startsWith("gemini-argon")) return "gemini-argon";
+    if (id.startsWith("gemini")) return "gemini";
+    if (id.startsWith("3p")) return "claude-gpt";
+    return null;
+  }
+  const name = displayName.toLowerCase();
+  if (name.includes("argon")) return "gemini-argon";
+  if (name.includes("gemini")) return "gemini";
+  if (name.includes("claude") || name.includes("gpt")) return "claude-gpt";
+  return null;
+}
+
 function parseAntigravitySummary(payload: unknown): QuotaGroup[] | null {
   if (!payload || typeof payload !== "object") return null;
   const summary = payload as AntigravityQuotaSummary;
@@ -244,23 +275,22 @@ function parseAntigravitySummary(payload: unknown): QuotaGroup[] | null {
 
   const groups = new Map<string, QuotaGroup>();
   for (const family of summary.groups) {
-    const name = family.displayName?.toLowerCase() ?? "";
-    const id = name.includes("gemini") ? "gemini" : name.includes("claude") || name.includes("gpt") ? "claude-gpt" : null;
-    if (!id || !Array.isArray(family.buckets)) continue;
+    if (!Array.isArray(family.buckets)) continue;
 
     for (const bucket of family.buckets) {
+      const familyId = antigravityFamily(bucket.bucketId, family.displayName ?? "");
       const window = (bucket.window ?? bucket.bucketId ?? "").toLowerCase();
       const period = window.includes("week") ? "weekly" : /5h|five.hour/.test(window) ? "5h" : null;
-      if (!period) continue;
+      if (!familyId || !period) continue;
 
-      const groupId = `${id}-${period}`;
+      const groupId = `${familyId}-${period}`;
       const resetTime = typeof bucket.resetTime === "string" && Number.isFinite(Date.parse(bucket.resetTime))
         ? bucket.resetTime : null;
       // Protobuf JSON omits zero values, so an exhausted bucket arrives without remainingFraction.
       const remaining = bucket.remainingFraction === undefined && resetTime ? 0 : bucket.remainingFraction;
       groups.set(groupId, {
         id: groupId,
-        label: `${id === "gemini" ? "Gemini" : "Claude/GPT"} · ${period === "weekly" ? "Weekly" : "5-hour"}`,
+        label: `${ANTIGRAVITY_FAMILY_LABELS[familyId]} · ${period === "weekly" ? "Weekly" : "5-hour"}`,
         remainingFraction: typeof remaining === "number" && Number.isFinite(remaining) && remaining >= 0 && remaining <= 1
           ? remaining : null,
         resetTime,
@@ -269,7 +299,8 @@ function parseAntigravitySummary(payload: unknown): QuotaGroup[] | null {
     }
   }
 
-  const ordered = ["gemini-weekly", "gemini-5h", "claude-gpt-weekly", "claude-gpt-5h"]
+  const ordered = Object.keys(ANTIGRAVITY_FAMILY_LABELS)
+    .flatMap((family) => [`${family}-weekly`, `${family}-5h`])
     .flatMap((id) => { const group = groups.get(id); return group ? [group] : []; });
   return ordered.length > 0 ? ordered : null;
 }
@@ -300,7 +331,7 @@ async function fetchAntigravityProjectId(authIndex: string): Promise<string | nu
         header: {
           Authorization: "Bearer $TOKEN$",
           "Content-Type": "application/json",
-          "User-Agent": "antigravity/1.11.5 windows/amd64",
+          "User-Agent": ANTIGRAVITY_USER_AGENT,
         },
         data: JSON.stringify({
           metadata: {
@@ -376,7 +407,7 @@ async function fetchAntigravityPayload<T>(
           header: {
             Authorization: "Bearer $TOKEN$",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/1.11.5 windows/amd64",
+            "User-Agent": ANTIGRAVITY_USER_AGENT,
           },
           data: payload,
         }),
@@ -474,10 +505,12 @@ async function fetchAntigravityModels(authIndex: string, projectId: string | nul
 
 async function fetchAntigravityQuota(authIndex: string): Promise<AntigravityQuotaSnapshot | { error: string }> {
   const projectId = await fetchAntigravityProjectId(authIndex);
-  // The capacity chart is fed only by Gemini windows, so a summary that lacks
-  // them is a degraded fallback, not a success — keep probing for one that has them.
-  const isGeminiBearing = (groups: QuotaGroup[]): boolean => groups.some((group) => group.id.startsWith("gemini-"));
-  const summary = await fetchAntigravityPayload(authIndex, projectId, ANTIGRAVITY_SUMMARY_ENDPOINTS, parseAntigravitySummary, isGeminiBearing);
+  // Some endpoints answer with only the Claude/GPT group (or Pro-only Argon windows);
+  // keep looking for one with shared Gemini windows — that summary is the success,
+  // anything else is a degraded fallback (fork PR #1-#4 semantics, argon-aware per #330).
+  const isSharedGeminiBearing = (groups: QuotaGroup[]): boolean =>
+    groups.some((group) => group.id.startsWith("gemini-") && !group.id.startsWith("gemini-argon-"));
+  const summary = await fetchAntigravityPayload(authIndex, projectId, ANTIGRAVITY_SUMMARY_ENDPOINTS, parseAntigravitySummary, isSharedGeminiBearing);
   if ("error" in summary) return summary;
 
   return {
@@ -487,66 +520,19 @@ async function fetchAntigravityQuota(authIndex: string): Promise<AntigravityQuot
   };
 }
 
-interface CodexRateWindow {
-  limit_window_seconds?: number;
-  used_percent?: number;
-  reset_at?: number;
-}
-
-interface CodexWhamUsageResponse {
-  rate_limit?: {
-    primary_window?: CodexRateWindow;
-    secondary_window?: CodexRateWindow;
-  };
-  plan_type?: string;
-}
-
-function formatWindowLabel(seconds: number): string {
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m Window`;
-  return `${Math.round(minutes / 60)}h Window`;
-}
-
-function parseCodexQuota(data: CodexWhamUsageResponse): QuotaGroup[] {
-  const groups: QuotaGroup[] = [];
-
-  const windows: Array<{ key: string; label: string; window: CodexRateWindow | undefined }> = [
-    { key: "primary", label: "Primary", window: data.rate_limit?.primary_window },
-    { key: "secondary", label: "Secondary", window: data.rate_limit?.secondary_window },
-  ];
-
-  for (const { key, window } of windows) {
-    if (!window || window.used_percent === undefined) continue;
-
-    const remainingFraction = Math.max(0, Math.min(1, 1 - window.used_percent / 100));
-    const resetTime = window.reset_at
-      ? new Date(window.reset_at * 1000).toISOString()
-      : null;
-    const label = window.limit_window_seconds
-      ? formatWindowLabel(window.limit_window_seconds)
-      : `${key.charAt(0).toUpperCase() + key.slice(1)} Window`;
-
-    groups.push({
-      id: `${key}-window`,
-      label,
-      remainingFraction,
-      resetTime,
-      models: [
-        {
-          id: `${key}-window`,
-          displayName: label,
-          remainingFraction,
-          resetTime,
-        },
-      ],
-    });
-  }
-
-  return groups;
+/** Returns the ChatGPT workspace id of a Codex auth file, or undefined when it has none. */
+function codexAccountId(account: AuthFile): string | undefined {
+  // The management API response is untrusted JSON, so check the shape at runtime.
+  const idToken: unknown = account.id_token;
+  if (!idToken || typeof idToken !== "object") return undefined;
+  const accountId: unknown = (idToken as Record<string, unknown>).chatgpt_account_id;
+  if (typeof accountId !== "string") return undefined;
+  return accountId.trim() || undefined;
 }
 
 async function fetchCodexQuota(
-  authIndex: string
+  authIndex: string,
+  accountId?: string
 ): Promise<QuotaGroup[] | { error: string }> {
   try {
     const response = await fetch(`${CLIPROXYAPI_MANAGEMENT_URL}/api-call`, {
@@ -563,6 +549,8 @@ async function fetchCodexQuota(
         header: {
           Authorization: "Bearer $TOKEN$",
           "User-Agent": "codex-cli/1.0.0",
+          // Picks the same workspace CLIProxyAPI's Codex executor uses, for accounts in several workspaces.
+          ...(accountId ? { "Chatgpt-Account-Id": accountId } : {}),
         },
       }),
     });
@@ -1033,13 +1021,6 @@ async function callClaudeUsageEndpoint(
 
   logger.warn({ authIndex }, "Claude OAuth usage endpoint persistently 429, falling back to messages endpoint");
   return null;
-}
-
-function slugifyLabel(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
 }
 
 function humanizeLimitKind(value: string): string {
@@ -1582,7 +1563,7 @@ export async function GET(request: NextRequest) {
       }
 
       if (providerNorm === "codex") {
-        const result = await fetchCodexQuota(authIndex);
+        const result = await fetchCodexQuota(authIndex, codexAccountId(account));
         
         if ("error" in result) {
           return {

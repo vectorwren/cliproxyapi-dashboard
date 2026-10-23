@@ -82,6 +82,34 @@ describe("isShortTermQuotaWindow", () => {
     });
   });
 
+  describe("provider-reported window duration", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-10-16T00:00:00Z"));
+    });
+    afterEach(() => vi.useRealTimers());
+
+    it.each([
+      ["primary-window", 18000, true],
+      ["secondary-window", 18000, true],
+      ["primary-window", 90000, false],
+      ["secondary-window", 90000, false],
+      ["primary-window", 604800, false],
+      ["secondary-window", 604800, false],
+    ] as const)("classifies %s with %i seconds independently of its label", (id, windowSeconds, expected) => {
+      // A translated label carries no "5h"/"weekly" hint, so only the duration can decide.
+      expect(isShortTermQuotaWindow({
+        id, label: "套餐窗口", windowSeconds, resetTime: "2026-10-16T01:00:00Z",
+      })).toBe(expected);
+    });
+
+    it.each([undefined, 0, -1, Number.NaN])("retains legacy ID rules without a valid duration (%s)", (windowSeconds) => {
+      expect(isShortTermQuotaWindow({
+        id: "primary-window", label: "Primary Window", windowSeconds, resetTime: null,
+      })).toBe(true);
+    });
+  });
+
   it("treats windows without markers or reset time as long-term", () => {
     expect(
       isShortTermQuotaWindow({
@@ -94,21 +122,25 @@ describe("isShortTermQuotaWindow", () => {
 });
 
 describe("capacityQuotaGroups", () => {
-  const groups = ["gemini-weekly", "gemini-5h", "claude-gpt-weekly", "claude-gpt-5h"].map((id) => ({ id, label: id, resetTime: null }));
+  const groups = ["gemini-weekly", "gemini-5h", "gemini-argon-weekly", "claude-gpt-weekly", "claude-gpt-5h"].map((id) => ({ id, label: id, resetTime: null }));
   it("keeps Gemini AND Claude/GPT windows for Antigravity (both families count since the 2026-10-18 bar-rule change)", () => {
     expect(capacityQuotaGroups("antigravity", groups).map(({ id }) => id)).toEqual(
       ["gemini-weekly", "gemini-5h", "claude-gpt-weekly", "claude-gpt-5h"],
     );
   });
   it("keeps Gemini-only windows when that is all Antigravity supplies (legacy shape)", () => {
-    const geminiOnly = groups.slice(0, 2);
+    const geminiOnly = ["gemini-weekly", "gemini-5h"].map((id) => ({ id, label: id, resetTime: null }));
     expect(capacityQuotaGroups("antigravity", geminiOnly).map(({ id }) => id)).toEqual(["gemini-weekly", "gemini-5h"]);
   });
   it("keeps Claude/GPT-only windows when that is all Antigravity supplies (shape since upstream dropped the Gemini family)", () => {
-    const claudeOnly = groups.slice(2);
+    const claudeOnly = ["claude-gpt-weekly", "claude-gpt-5h"].map((id) => ({ id, label: id, resetTime: null }));
     expect(capacityQuotaGroups("antigravity", claudeOnly).map(({ id }) => id)).toEqual(["claude-gpt-weekly", "claude-gpt-5h"]);
   });
+  it("excludes the Pro-only Gemini 4 Argon windows from Antigravity capacity (upstream #330 keeps them reference-only)", () => {
+    const withArgon = ["gemini-weekly", "gemini-5h", "gemini-argon-weekly", "gemini-argon-wtu-weekly", "claude-gpt-weekly"].map((id) => ({ id, label: id, resetTime: null }));
+    expect(capacityQuotaGroups("antigravity", withArgon).map(({ id }) => id)).toEqual(["gemini-weekly", "gemini-5h", "claude-gpt-weekly"]);
+  });
   it("keeps every window for other providers", () => {
-    expect(capacityQuotaGroups("claude", groups)).toHaveLength(4);
+    expect(capacityQuotaGroups("claude", groups)).toHaveLength(5);
   });
 });

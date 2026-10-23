@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: dashboard
+
+jobs:
+  # Runs untrusted PR code: GitHub-hosted only — never self-hosted (public repo).
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Build-time placeholders, identical to dashboard/Dockerfile — not real secrets.
+      DATABASE_URL: postgresql://build:build@localhost:5432/build
+      JWT_SECRET: build-time-placeholder-at-least-32-chars
+      MANAGEMENT_API_KEY: build-time-placeholder-16ch
+      CLIPROXYAPI_MANAGEMENT_URL: http://127.0.0.1:8317/v0/management
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # Same flags as dashboard/Dockerfile. Prisma generate runs via the pre-scripts.
+      - run: npm ci --legacy-peer-deps --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

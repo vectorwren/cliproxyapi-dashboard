@@ -11,7 +11,8 @@ vi.mock("@/lib/errors", () => ({
   Errors: {
     unauthorized: () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }),
     internal: () => new Response(JSON.stringify({ error: "internal" }), { status: 500 }),
-    zodValidation: () => new Response(JSON.stringify({ error: "validation" }), { status: 400 }),
+    zodValidation: (issues: { path: (string | number)[] }[]) =>
+      new Response(JSON.stringify({ error: "validation", fields: issues.map((issue) => issue.path.join(".")) }), { status: 400 }),
   },
   apiSuccess: (data: unknown) => new Response(JSON.stringify(data), { status: 200 }),
 }));
@@ -40,7 +41,22 @@ describe("PUT /api/agent-config-slim", () => {
     }));
   });
 
-  it("accepts and stores advanced slim config shapes", async () => {
+  it("rejects an out-of-range companion speed with a 400 naming the field", async () => {
+    const { PUT } = await import("./route");
+
+    const response = await PUT(
+      new Request("http://localhost/api/agent-config-slim", {
+        method: "PUT",
+        body: JSON.stringify({ overrides: { companion: { speed: 9 } } }),
+      }) as unknown as NextRequest,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ fields: ["overrides.companion.speed"] });
+    expect(upsertMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts advanced slim config shapes and drops keys slim 3.x removed", async () => {
     const { PUT } = await import("./route");
 
     const requestBody = {
@@ -101,15 +117,18 @@ describe("PUT /api/agent-config-slim", () => {
     expect(data.overrides.interview.dashboard).toBe(true);
     expect(data.overrides.multiplexer.type).toBe("zellij");
     expect(data.overrides.disabled_agents).toEqual(["observer"]);
-    expect(data.overrides.fallback.retry_on_empty).toBe(true);
-    expect(data.overrides.presets.review.orchestrator.model).toEqual([
+    expect(data.overrides.fallback).toEqual({ enabled: true, chains: requestBody.overrides.fallback.chains });
+    expect(data.overrides.presets.review.agents.orchestrator.model).toEqual([
       "gemini-2.5-pro",
       { id: "claude-opus-4.6", variant: "high" },
     ]);
-    expect(data.overrides.presets.review.observer.model).toBe("openai/gpt-4.1-mini");
+    expect(data.overrides.presets.review.agents.observer.model).toBe("openai/gpt-4.1-mini");
     expect(data.overrides.agents["council-master"].model).toBe("anthropic/claude-opus-4-6");
     expect(data.overrides.council.presets.default.councillors.alpha.model).toBe("openai/gpt-5-mini");
-    expect(data.overrides.council.presets.default.master.variant).toBe("high");
+    expect(data.overrides.council).toEqual({
+      presets: { default: { councillors: { alpha: { model: "openai/gpt-5-mini" } } } },
+      default_preset: "default",
+    });
 
     expect(upsertMock).toHaveBeenCalledTimes(1);
     const upsertCall = upsertMock.mock.calls[0];
@@ -117,7 +136,8 @@ describe("PUT /api/agent-config-slim", () => {
     const [upsertArgs] = upsertCall!;
     const saved = upsertArgs.create.slimOverrides as Record<string, unknown>;
     expect(saved.interview).toEqual({ maxQuestions: 3, dashboard: true, port: 43211 });
-    expect(saved.websearch).toEqual({ provider: "tavily" });
+    expect(saved).not.toHaveProperty("websearch");
+    expect(saved).not.toHaveProperty("todoContinuation");
   });
 });
 
